@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TEDERGA Code Quality Analyzer</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0e1a; color: #e2e8f0; font-family: 'Inter', -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; } 
+    ::-webkit-scrollbar-track { background: #111827; }
+    ::-webkit-scrollbar-thumb { background: #2d3a4f; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+const { useState, useEffect, useCallback, useMemo } = React;
+
+const LANG_CONFIGS = {
+  javascript: { extensions: [".js",".jsx",".mjs"], functionPatterns: [/function\s+(\w+)\s*\(/g, /(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[\w]+)\s*=>/g, /(\w+)\s*:\s*(?:async\s+)?function/g, /(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{/g], classPattern: /class\s+(\w+)/g, namingConvention: "camelCase" },
+  typescript: { extensions: [".ts",".tsx"], functionPatterns: [/function\s+(\w+)\s*[<(]/g, /(?:const|let|var)\s+(\w+)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:\([^)]*\)|[\w]+)\s*=>/g, /(?:async\s+)?(\w+)\s*\([^)]*\)\s*(?::[^{]+)?\s*\{/g], classPattern: /(?:class|interface|type|enum)\s+(\w+)/g, namingConvention: "camelCase" },
+  csharp: { extensions: [".cs"], functionPatterns: [/(?:public|private|protected|internal|static|async|virtual|override|abstract)\s+(?:\w+(?:<[^>]+>)?)\s+(\w+)\s*\(/g], classPattern: /(?:class|interface|struct|enum|record)\s+(\w+)/g, namingConvention: "PascalCase" },
+  dart: { extensions: [".dart"], functionPatterns: [/(?:void|int|String|bool|double|Future|Stream|dynamic|Widget|\w+)\s+(\w+)\s*\(/g], classPattern: /(?:class|mixin|extension|enum)\s+(\w+)/g, namingConvention: "camelCase" },
+  go: { extensions: [".go"], functionPatterns: [/func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(/g], classPattern: /type\s+(\w+)\s+struct/g, namingConvention: "camelCase" },
+  vue: { extensions: [".vue"], functionPatterns: [/function\s+(\w+)\s*\(/g, /(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[\w]+)\s*=>/g], classPattern: /(?:name|components)\s*:/g, namingConvention: "camelCase" },
+};
+
+function detectLanguage(filename) {
+  const ext = "." + filename.split(".").pop().toLowerCase();
+  for (const [lang, config] of Object.entries(LANG_CONFIGS)) {
+    if (config.extensions.includes(ext)) return lang;
+  }
+  return "javascript";
+}
+
+function countLines(code) {
+  const lines = code.split("\n");
+  let blank = 0, comment = 0, inMulti = false;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) { blank++; continue; }
+    if (inMulti) { comment++; if (t.includes("*/")) inMulti = false; continue; }
+    if (t.startsWith("//") || t.startsWith("#")) { comment++; continue; }
+    if (t.startsWith("/*")) { comment++; if (!t.includes("*/")) inMulti = true; continue; }
+  }
+  return { total: lines.length, blank, comment, code: lines.length - blank - comment };
+}
+
+function calcComplexity(code) {
+  let c = 1;
+  [/\bif\b/g,/\belse if\b/g,/\bwhile\b/g,/\bfor\b/g,/\bforeach\b/g,/\bcase\b/g,/\bcatch\b/g,/&&/g,/\|\|/g,/\?[^:]/g].forEach(p => { const m = code.match(p); if (m) c += m.length; });
+  return c;
+}
+
+function extractBody(code, idx) {
+  let depth = 0, started = false, i = idx;
+  while (i < code.length && i - idx < 5000) {
+    if (code[i] === "{") { depth++; started = true; }
+    else if (code[i] === "}" && --depth === 0 && started) return code.substring(idx, i + 1);
+    i++;
+  }
+  const end = code.indexOf("\n", idx);
+  return code.substring(idx, end > 0 ? end : idx + 200);
+}
+
+const RESERVED = new Set(["if","else","for","while","switch","catch","return","new","get","set","var","let","const","function","class","import","export","from","async","await","try","throw","void","null","undefined","true","false"]);
+
+function findFunctions(code, lang) {
+  const config = LANG_CONFIGS[lang];
+  if (!config) return [];
+  const fns = [], seen = new Set();
+  for (const pattern of config.functionPatterns) {
+    const re = new RegExp(pattern.source, pattern.flags);
+    let m;
+    while ((m = re.exec(code)) !== null) {
+      const name = m[1];
+      if (!name || RESERVED.has(name)) continue;
+      const startLine = code.substring(0, m.index).split("\n").length;
+      const key = name + ":" + startLine;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const body = extractBody(code, m.index);
+      fns.push({ name, startLine, lineCount: body.split("\n").length, complexity: calcComplexity(body) });
+    }
+  }
+  return fns;
+}
+
+function detectDuplication(code) {
+  const lines = code.split("\n").map(l => l.trim()).filter(l => l.length > 10 && !l.startsWith("//") && !l.startsWith("import"));
+  const dupes = new Map();
+  for (let i = 0; i < lines.length - 2; i++) {
+    const block = lines.slice(i, i + 3).join("|");
+    dupes.has(block) ? dupes.get(block).count++ : dupes.set(block, { count: 1 });
+  }
+  const found = [...dupes.entries()].filter(([,v]) => v.count > 1);
+  const dupLines = found.reduce((s, [,v]) => s + v.count * 3, 0);
+  return { percentage: Math.min(lines.length > 0 ? (dupLines / lines.length) * 100 : 0, 100), instances: found.length };
+}
+
+function checkSmells(code) {
+  const smells = [];
+  code.split("\n").forEach((line, i) => {
+    if (line.length > 120) smells.push({ line: i+1, message: "Satir cok uzun (" + line.length + " karakter)", severity: "warning" });
+  });
+  let m;
+  const todoRe = /\/\/\s*(TODO|FIXME|HACK|BUG)[\s:]/gi;
+  while ((m = todoRe.exec(code)) !== null) smells.push({ line: code.substring(0,m.index).split("\n").length, message: m[1] + " yorum bulundu", severity: "info" });
+  const debugRe = /console\.(log|warn|error|debug)\(/g;
+  while ((m = debugRe.exec(code)) !== null) smells.push({ line: code.substring(0,m.index).split("\n").length, message: "Debug/log ifadesi birakilmis", severity: "warning" });
+  const emptyCatch = /catch\s*(?:\([^)]*\))?\s*\{\s*\}/g;
+  while ((m = emptyCatch.exec(code)) !== null) smells.push({ line: code.substring(0,m.index).split("\n").length, message: "Bos catch blogu", severity: "error" });
+  let depth = 0;
+  code.split("\n").forEach((line, i) => {
+    depth += (line.match(/\{/g)||[]).length - (line.match(/\}/g)||[]).length;
+    if (depth > 4) smells.push({ line: i+1, message: "Derin ic ice gecme (" + depth + " seviye)", severity: "error" });
+  });
+  return smells;
+}
+
+function analyzeFile(filename, code) {
+  const lang = detectLanguage(filename);
+  const lineInfo = countLines(code);
+  const fns = findFunctions(code, lang);
+  const duplication = detectDuplication(code);
+  const codeSmells = checkSmells(code);
+  const avgC = fns.length > 0 ? fns.reduce((s,f) => s+f.complexity,0)/fns.length : 1;
+  const maxC = fns.length > 0 ? Math.max(...fns.map(f => f.complexity)) : 1;
+  const commentRatio = lineInfo.code > 0 ? (lineInfo.comment/lineInfo.code)*100 : 0;
+  const longFns = fns.filter(f => f.lineCount > 50);
+  let score = 100;
+  const penalties = [];
+  const add = (metric, value, p) => { score -= p; penalties.push({ metric, value, penalty: -p }); };
+  if (avgC > 15) add("Ort. Karmasiklik", avgC.toFixed(1), 25);
+  else if (avgC > 10) add("Ort. Karmasiklik", avgC.toFixed(1), 15);
+  else if (avgC > 7) add("Ort. Karmasiklik", avgC.toFixed(1), 8);
+  if (duplication.percentage > 20) add("Kod Tekrari", "%" + duplication.percentage.toFixed(1), 20);
+  else if (duplication.percentage > 10) add("Kod Tekrari", "%" + duplication.percentage.toFixed(1), 12);
+  else if (duplication.percentage > 5) add("Kod Tekrari", "%" + duplication.percentage.toFixed(1), 5);
+  if (lineInfo.code > 500) add("Dosya Uzunlugu", lineInfo.code + " satir", 10);
+  else if (lineInfo.code > 300) add("Dosya Uzunlugu", lineInfo.code + " satir", 5);
+  if (longFns.length > 3) add("Uzun Fonksiyonlar", longFns.length + " adet", 15);
+  else if (longFns.length > 0) add("Uzun Fonksiyonlar", longFns.length + " adet", 5*longFns.length);
+  const errS = codeSmells.filter(s => s.severity==="error").length;
+  const warnS = codeSmells.filter(s => s.severity==="warning").length;
+  if (errS > 0) add("Kritik Sorunlar", errS + " adet", Math.min(errS*5,20));
+  if (warnS > 5) add("Uyarilar", warnS + " adet", Math.min(warnS*2,15));
+  if (commentRatio < 3 && lineInfo.code > 50) add("Yorum Orani", "%" + commentRatio.toFixed(1), 5);
+  score = Math.max(0, Math.min(100, score));
+  const grade = score>=90?"A":score>=80?"B":score>=70?"C":score>=60?"D":"F";
+  return { filename, language: lang, score, grade, lines: lineInfo, functions: { total: fns.length, avgComplexity: avgC.toFixed(1), maxComplexity: maxC, all: fns.map(f => ({name:f.name,lines:f.lineCount,complexity:f.complexity})), longFunctions: longFns.map(f=>({name:f.name,lines:f.lineCount,complexity:f.complexity})) }, duplication, codeSmells, commentRatio: commentRatio.toFixed(1), penalties };
+}
+
+const SAMPLE_FILES = {
+  "UserService.cs": `using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace Tederga.Services {
+    public class UserService : IUserService {
+        private readonly AppDbContext _context;
+        private readonly ILogger<UserService> _logger;
+
+        public UserService(AppDbContext context, ILogger<UserService> logger) {
+            _context = context; _logger = logger;
+        }
+
+        // TODO: Bu metodu refactor et
+        public async Task<UserDto> GetUserWithPermissions(int userId) {
+            var user = await _context.Users
+                .Include(u => u.Roles).ThenInclude(r => r.Permissions)
+                .FirstOrDefaultAsync(u => u.Id == userId);
+            if (user == null) return null;
+            return new UserDto { Id = user.Id, Name = user.Name, Email = user.Email,
+                Permissions = user.Roles.SelectMany(r => r.Permissions).Select(p => p.Name).Distinct().ToList() };
+        }
+
+        public async Task<List<UserDto>> SearchUsers(string query, int page, int pageSize, string sortBy, bool ascending, string role, bool? isActive, DateTime? createdAfter, DateTime? createdBefore) {
+            var q = _context.Users.AsQueryable();
+            if (!string.IsNullOrEmpty(query)) {
+                if (query.Contains("@")) { q = q.Where(u => u.Email.Contains(query)); }
+                else {
+                    if (query.Length > 3) { q = q.Where(u => u.Name.Contains(query) || u.Email.Contains(query)); }
+                    else { q = q.Where(u => u.Name.StartsWith(query)); }
+                }
+            }
+            if (!string.IsNullOrEmpty(role)) { q = q.Where(u => u.Roles.Any(r => r.Name == role)); }
+            if (isActive.HasValue) {
+                if (isActive.Value) { q = q.Where(u => u.IsActive && u.LastLoginDate > DateTime.Now.AddDays(-30)); }
+                else { q = q.Where(u => !u.IsActive || u.LastLoginDate <= DateTime.Now.AddDays(-30)); }
+            }
+            if (sortBy == "name") q = ascending ? q.OrderBy(u => u.Name) : q.OrderByDescending(u => u.Name);
+            else if (sortBy == "email") q = ascending ? q.OrderBy(u => u.Email) : q.OrderByDescending(u => u.Email);
+            else q = q.OrderByDescending(u => u.CreatedAt);
+            return await q.Skip((page-1)*pageSize).Take(pageSize).Select(u => new UserDto { Id=u.Id,Name=u.Name,Email=u.Email }).ToListAsync();
+        }
+
+        public async Task<bool> DeactivateUser(int userId) {
+            try {
+                var user = await _context.Users.FindAsync(userId);
+                if (user != null) { user.IsActive = false; await _context.SaveChangesAsync(); return true; }
+                return false;
+            } catch (Exception ex) { _logger.LogError(ex, "Error"); return false; }
+        }
+
+        // FIXME: Cache stratejisi iyilestirilmeli
+        public async Task<int> GetActiveUserCount() {
+            return await _context.Users.CountAsync(u => u.IsActive && u.LastLoginDate > DateTime.Now.AddDays(-30));
+        }
+    }
+}`,
+  "dashboard.component.ts": `import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Subject, combineLatest, takeUntil } from 'rxjs';
+
+@Component({ selector: 'app-dashboard', templateUrl: './dashboard.component.html' })
+export class DashboardComponent implements OnInit, OnDestroy {
+  private destroy$ = new Subject<void>();
+  dashboardData: any = null;
+  isLoading = true;
+  errorMessage = '';
+  selectedPeriod = 'monthly';
+
+  constructor(private dashboardService: any) {}
+  ngOnInit(): void { this.loadDashboard(); }
+  ngOnDestroy(): void { this.destroy$.next(); this.destroy$.complete(); }
+
+  loadDashboard(): void {
+    this.isLoading = true;
+    combineLatest([
+      this.dashboardService.getDashboardData(this.selectedPeriod),
+      this.dashboardService.getChartConfig()
+    ]).pipe(takeUntil(this.destroy$)).subscribe({
+      next: ([data, config]: any) => { this.dashboardData = data; this.isLoading = false; },
+      error: (err: any) => { console.error('Dashboard loading failed:', err); this.errorMessage = 'Hata'; this.isLoading = false; }
+    });
+  }
+
+  getStatusColor(status: string): string {
+    if (status === 'open') return '#ef4444';
+    if (status === 'in-progress') return '#f59e0b';
+    if (status === 'resolved') return '#22c55e';
+    return '#9ca3af';
+  }
+
+  exportReport(): void {
+    console.log('Exporting...');
+    this.dashboardService.exportToPdf(this.dashboardData).pipe(takeUntil(this.destroy$)).subscribe({
+      next: (blob: Blob) => {
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'report.pdf'; a.click();
+      },
+      error: (err: any) => { console.error('Export failed:', err); }
+    });
+  }
+}`,
+  "api_handler.go": `package handlers
+import (
+  "encoding/json"
+  "fmt"
+  "log"
+  "net/http"
+  "strconv"
+  "time"
+)
+type APIHandler struct { db *Database; cache *Cache; logger *log.Logger }
+type Response struct { Success bool; Data interface{}; Error string }
+func NewAPIHandler(db *Database, cache *Cache, logger *log.Logger) *APIHandler {
+  return &APIHandler{db: db, cache: cache, logger: logger}
+}
+func (h *APIHandler) HandleGetUsers(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodGet { h.sendError(w, "Not allowed", http.StatusMethodNotAllowed); return }
+  page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+  if page < 1 { page = 1 }
+  pageSize, _ := strconv.Atoi(r.URL.Query().Get("pagesize"))
+  if pageSize < 1 || pageSize > 100 { pageSize = 20 }
+  cacheKey := fmt.Sprintf("users:%d:%d", page, pageSize)
+  if cached, ok := h.cache.Get(cacheKey); ok { h.sendJSON(w, cached); return }
+  users, _, err := h.db.GetUsers(page, pageSize)
+  if err != nil { h.logger.Printf("Error: %v", err); h.sendError(w, "Server error", http.StatusInternalServerError); return }
+  resp := Response{Success: true, Data: users}
+  h.cache.Set(cacheKey, resp, 5*time.Minute)
+  h.sendJSON(w, resp)
+}
+func (h *APIHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) {
+  if r.Method != http.MethodPost { h.sendError(w, "Not allowed", http.StatusMethodNotAllowed); return }
+  var input struct { Name string; Email string; Role string }
+  if err := json.NewDecoder(r.Body).Decode(&input); err != nil { h.sendError(w, "Bad request", http.StatusBadRequest); return }
+  if input.Name == "" || input.Email == "" { h.sendError(w, "Required fields missing", http.StatusBadRequest); return }
+  user, err := h.db.CreateUser(input.Name, input.Email, input.Role)
+  if err != nil { h.sendError(w, "Create failed", http.StatusInternalServerError); return }
+  h.sendJSON(w, Response{Success: true, Data: user})
+}
+func (h *APIHandler) sendJSON(w http.ResponseWriter, data interface{}) {
+  w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(data)
+}
+func (h *APIHandler) sendError(w http.ResponseWriter, msg string, status int) {
+  w.Header().Set("Content-Type", "application/json"); w.WriteHeader(status); json.NewEncoder(w).Encode(Response{Success: false, Error: msg})
+}`,
+  "ProductList.vue": `<template>
+  <div class="product-list">
+    <div class="filters">
+      <input v-model="searchQuery" @input="debouncedSearch" placeholder="Urun ara..." />
+      <select v-model="selectedCategory" @change="filterProducts">
+        <option value="">Tum Kategoriler</option>
+        <option v-for="cat in categories" :key="cat.id" :value="cat.id">{{ cat.name }}</option>
+      </select>
+    </div>
+    <div v-if="loading">Yukleniyor...</div>
+    <div v-else-if="error">{{ error }}</div>
+    <div v-else class="grid">
+      <div v-for="product in filteredProducts" :key="product.id" @click="openProduct(product)">
+        <h3>{{ product.name }}</h3>
+        <p>{{ formatPrice(product.price) }}</p>
+        <button @click.stop="addToCart(product)" :disabled="product.stock === 0">Sepete Ekle</button>
+      </div>
+    </div>
+    <div class="pagination" v-if="totalPages > 1">
+      <button @click="prevPage" :disabled="currentPage === 1">Onceki</button>
+      <span>{{ currentPage }} / {{ totalPages }}</span>
+      <button @click="nextPage" :disabled="currentPage === totalPages">Sonraki</button>
+    </div>
+  </div>
+</template>
+<script>
+import { ref, computed, onMounted } from 'vue';
+export default {
+  name: 'ProductList',
+  setup() {
+    const products = ref([]), loading = ref(false), error = ref('');
+    const searchQuery = ref(''), selectedCategory = ref(''), sortBy = ref('name');
+    const currentPage = ref(1), pageSize = 12, totalCount = ref(0);
+    const totalPages = computed(() => Math.ceil(totalCount.value / pageSize));
+    const filteredProducts = computed(() => {
+      let result = [...products.value];
+      if (selectedCategory.value) result = result.filter(p => p.categoryId === selectedCategory.value);
+      if (sortBy.value === 'name') result.sort((a,b) => a.name.localeCompare(b.name));
+      else if (sortBy.value === 'price') result.sort((a,b) => a.price - b.price);
+      return result;
+    });
+    const fetchProducts = async () => {
+      loading.value = true; error.value = '';
+      try {
+        const r = await fetch('/api/products?page=' + currentPage.value);
+        const data = await r.json();
+        products.value = data.items; totalCount.value = data.total;
+      } catch (err) { error.value = 'Yukleme hatasi'; console.error(err); }
+      finally { loading.value = false; }
+    };
+    const formatPrice = p => new Intl.NumberFormat('tr-TR',{style:'currency',currency:'TRY'}).format(p);
+    const prevPage = () => { if (currentPage.value > 1) { currentPage.value--; fetchProducts(); }};
+    const nextPage = () => { if (currentPage.value < totalPages.value) { currentPage.value++; fetchProducts(); }};
+    const addToCart = product => console.log('add', product.id);
+    const openProduct = product => console.log('open', product.id);
+    const debouncedSearch = () => { currentPage.value = 1; fetchProducts(); };
+    const filterProducts = () => { currentPage.value = 1; fetchProducts(); };
+    onMounted(fetchProducts);
+    return { products, loading, error, searchQuery, selectedCategory, sortBy, currentPage, totalPages, filteredProducts, debouncedSearch, filterProducts, prevPage, nextPage, addToCart, openProduct, formatPrice };
+  }
+};
+</script>`,
+  "auth_middleware.ts": `import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
+const TOKEN_EXPIRY = '24h';
+const REFRESH_TOKEN_EXPIRY = '7d';
+interface TokenPayload { userId: number; email: string; roles: string[]; }
+interface AuthRequest extends Request { user?: TokenPayload; }
+
+export const generateTokens = async (user: {id:number;email:string;roles:string[]}) => {
+  const payload: TokenPayload = { userId: user.id, email: user.email, roles: user.roles };
+  const accessToken = jwt.sign(payload, JWT_SECRET, { expiresIn: TOKEN_EXPIRY });
+  const refreshToken = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: REFRESH_TOKEN_EXPIRY });
+  return { accessToken, refreshToken };
+};
+
+export const authMiddleware = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Token bulunamadi' });
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET) as TokenPayload;
+    req.user = decoded;
+    next();
+  } catch (err) {
+    if (err instanceof jwt.TokenExpiredError) return res.status(401).json({ error: 'Token suresi dolmus', code: 'TOKEN_EXPIRED' });
+    if (err instanceof jwt.JsonWebTokenError) return res.status(401).json({ error: 'Gecersiz token' });
+    return res.status(500).json({ error: 'Sunucu hatasi' });
+  }
+};
+
+export const requireRole = (...roles: string[]) => (req: AuthRequest, res: Response, next: NextFunction) => {
+  if (!req.user) return res.status(401).json({ error: 'Yetkilendirme gerekli' });
+  const hasRole = roles.some(role => req.user!.roles.includes(role));
+  if (!hasRole) return res.status(403).json({ error: 'Yetkiniz yok' });
+  next();
+};
+
+export const refreshAccessToken = async (req: Request, res: Response) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ error: 'Refresh token gerekli' });
+    const decoded = jwt.verify(refreshToken, JWT_SECRET) as { userId: number };
+    const tokens = await generateTokens({ id: decoded.userId, email: '', roles: [] });
+    res.json({ success: true, ...tokens });
+  } catch { return res.status(401).json({ error: 'Token yenileme basarisiz' }); }
+};`,
+};
+
+const C = {
+  bg:"#0a0e1a",bgCard:"#111827",bgHover:"#1a2235",border:"#1e293b",borderL:"#2d3a4f",
+  primary:"#3b82f6",primaryL:"#60a5fa",success:"#22c55e",warning:"#f59e0b",danger:"#ef4444",
+  info:"#6366f1",text:"#e2e8f0",textS:"#94a3b8",textM:"#64748b",
+  A:"#22c55e",B:"#84cc16",C:"#f59e0b",D:"#f97316",F:"#ef4444"
+};
+const gc = g => C[g]||C.textM;
+const sc = s => s>=90?C.A:s>=80?C.B:s>=70?C.C:s>=60?C.D:C.F;
+const mono = {fontFamily:"'JetBrains Mono',monospace"};
+
+function Gauge({score,grade,size=140}) {
+  const r=(size-16)/2, circ=2*Math.PI*r, prog=(score/100)*circ, col=gc(grade);
+  return (
+    <div style={{position:"relative",width:size,height:size}}>
+      <svg width={size} height={size} style={{transform:"rotate(-90deg)"}}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={C.border} strokeWidth="6"/>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={col} strokeWidth="6"
+          strokeDasharray={circ} strokeDashoffset={circ-prog} strokeLinecap="round"
+          style={{transition:"stroke-dashoffset 1s ease"}}/>
+      </svg>
+      <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+        <span style={{fontSize:size*.22,fontWeight:800,color:col,...mono}}>{grade}</span>
+        <span style={{fontSize:size*.13,color:C.textS,...mono}}>{score}/100</span>
+      </div>
+    </div>
+  );
+}
+
+function Bar({label,value,max,color,suffix=""}) {
+  const pct=Math.min((value/max)*100,100);
+  return (
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+        <span style={{fontSize:12,color:C.textS}}>{label}</span>
+        <span style={{fontSize:12,color:C.text,...mono}}>{typeof value==="number"&&value.toFixed?value.toFixed(1):value}{suffix}</span>
+      </div>
+      <div style={{height:5,background:C.border,borderRadius:3,overflow:"hidden"}}>
+        <div style={{height:"100%",width:pct+"%",background:color,borderRadius:3,transition:"width .8s ease"}}/>
+      </div>
+    </div>
+  );
+}
+
+function Badge({severity}) {
+  const cfg={error:{bg:"rgba(239,68,68,.1)",c:C.danger,l:"Kritik"},warning:{bg:"rgba(245,158,11,.1)",c:C.warning,l:"Uyari"},info:{bg:"rgba(99,102,241,.1)",c:C.info,l:"Bilgi"}};
+  const x=cfg[severity]||cfg.info;
+  return <span style={{padding:"2px 8px",borderRadius:4,fontSize:10,fontWeight:600,background:x.bg,color:x.c,textTransform:"uppercase",letterSpacing:".05em"}}>{x.l}</span>;
+}
+
+function LangTag({lang}) {
+  const cols={javascript:"#f7df1e",typescript:"#3178c6",csharp:"#9b4993",dart:"#02569b",go:"#00add8",vue:"#42b883"};
+  const c=cols[lang]||"#666";
+  return <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"2px 10px",borderRadius:4,fontSize:11,fontWeight:600,background:c+"22",color:c,border:"1px solid "+c+"44"}}>
+    <span style={{width:6,height:6,borderRadius:"50%",background:c}}/>{lang.charAt(0).toUpperCase()+lang.slice(1)}
+  </span>;
+}
+
+function Detail({result,onClose}) {
+  if(!result) return null;
+  const col=gc(result.grade);
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,.75)",zIndex:1000,display:"flex",justifyContent:"center",alignItems:"flex-start",padding:"32px 16px",overflowY:"auto"}} onClick={onClose}>
+      <div style={{background:C.bgCard,borderRadius:16,border:"1px solid "+C.border,maxWidth:800,width:"100%",maxHeight:"88vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={{padding:"20px 24px",borderBottom:"1px solid "+C.border,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:4}}>
+              <h2 style={{margin:0,fontSize:18,color:C.text,fontWeight:700}}>{result.filename}</h2>
+              <LangTag lang={result.language}/>
+            </div>
+            <p style={{margin:0,color:C.textM,fontSize:12}}>Detayli Analiz Raporu</p>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <Gauge score={result.score} grade={result.grade} size={72}/>
+            <button onClick={onClose} style={{background:"none",border:"none",color:C.textM,fontSize:22,cursor:"pointer",lineHeight:1}}>&#x2715;</button>
+          </div>
+        </div>
+        <div style={{padding:"20px 24px"}}>
+          {result.penalties.length>0&&(
+            <div style={{marginBottom:20}}>
+              <h3 style={{color:C.text,fontSize:13,fontWeight:600,marginBottom:10,textTransform:"uppercase",letterSpacing:".05em"}}>Puan Kirilimi</h3>
+              <div style={{background:C.bg,borderRadius:8,padding:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:8,paddingBottom:8,borderBottom:"1px solid "+C.border}}>
+                  <span style={{color:C.textS,fontSize:12}}>Baslangic</span>
+                  <span style={{color:C.success,...mono,fontSize:14,fontWeight:700}}>100</span>
+                </div>
+                {result.penalties.map((p,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0"}}>
+                    <span style={{color:C.textS,fontSize:13}}>{p.metric} <span style={{color:C.textM}}>({p.value})</span></span>
+                    <span style={{color:C.danger,...mono,fontSize:13,fontWeight:600}}>{p.penalty}</span>
+                  </div>
+                ))}
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:8,paddingTop:8,borderTop:"1px solid "+C.border}}>
+                  <span style={{color:C.text,fontSize:13,fontWeight:600}}>Final Skor</span>
+                  <span style={{color:col,...mono,fontSize:16,fontWeight:800}}>{result.score}</span>
+                </div>
+              </div>
+            </div>
+          )}
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:20}}>
+            <div style={{background:C.bg,borderRadius:8,padding:14}}>
+              <h4 style={{color:C.textM,fontSize:10,textTransform:"uppercase",marginBottom:10,letterSpacing:".08em"}}>Satir Bilgisi</h4>
+              <Bar label="Kod" value={result.lines.code} max={500} color={C.primary}/>
+              <Bar label="Yorum" value={result.lines.comment} max={result.lines.code||1} color={C.info}/>
+              <Bar label="Bos" value={result.lines.blank} max={result.lines.total} color={C.textM}/>
+              <p style={{fontSize:12,color:C.textS,margin:"8px 0 0"}}>Yorum orani: <span style={{color:parseFloat(result.commentRatio)>10?C.success:C.warning,fontWeight:600}}>%{result.commentRatio}</span></p>
+            </div>
+            <div style={{background:C.bg,borderRadius:8,padding:14}}>
+              <h4 style={{color:C.textM,fontSize:10,textTransform:"uppercase",marginBottom:10,letterSpacing:".08em"}}>Karmasiklik & Tekrar</h4>
+              <Bar label="Ort. Karmasiklik" value={parseFloat(result.functions.avgComplexity)} max={20} color={parseFloat(result.functions.avgComplexity)<=7?C.success:parseFloat(result.functions.avgComplexity)<=12?C.warning:C.danger}/>
+              <Bar label="Maks. Karmasiklik" value={result.functions.maxComplexity} max={30} color={result.functions.maxComplexity<=10?C.success:C.warning}/>
+              <Bar label="Kod Tekrari" value={result.duplication.percentage} max={25} color={result.duplication.percentage<=5?C.success:C.warning} suffix="%"/>
+            </div>
+          </div>
+          {result.functions.all.length>0&&(
+            <div style={{marginBottom:20}}>
+              <h3 style={{color:C.text,fontSize:13,fontWeight:600,marginBottom:10,textTransform:"uppercase",letterSpacing:".05em"}}>Fonksiyonlar ({result.functions.total})</h3>
+              <div style={{background:C.bg,borderRadius:8,overflow:"hidden"}}>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead>
+                    <tr>{["Fonksiyon","Satir","Karmasiklik","Durum"].map(h=><th key={h} style={{padding:"8px 12px",textAlign:"left",fontSize:10,color:C.textM,textTransform:"uppercase",borderBottom:"1px solid "+C.border}}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {result.functions.all.map((f,i)=>{
+                      const iL=f.lines>50,iC=f.complexity>10;
+                      return <tr key={i} style={{borderBottom:"1px solid "+C.border}}>
+                        <td style={{padding:"7px 12px",...mono,fontSize:12,color:C.text}}>{f.name}</td>
+                        <td style={{padding:"7px 12px",...mono,fontSize:12,color:iL?C.warning:C.textS}}>{f.lines}</td>
+                        <td style={{padding:"7px 12px",...mono,fontSize:12,color:iC?C.danger:f.complexity>7?C.warning:C.success}}>{f.complexity}</td>
+                        <td style={{padding:"7px 12px",fontSize:11}}>
+                          {iL&&<span style={{color:C.warning,marginRight:6}}>Uzun</span>}
+                          {iC&&<span style={{color:C.danger}}>Karmasik</span>}
+                          {!iL&&!iC&&<span style={{color:C.success}}>OK</span>}
+                        </td>
+                      </tr>;
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {result.codeSmells.length>0&&(
+            <div>
+              <h3 style={{color:C.text,fontSize:13,fontWeight:600,marginBottom:10,textTransform:"uppercase",letterSpacing:".05em"}}>Kod Sorunlari ({result.codeSmells.length})</h3>
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {result.codeSmells.slice(0,12).map((s,i)=>(
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 12px",background:C.bg,borderRadius:6}}>
+                    <Badge severity={s.severity}/>
+                    <span style={{fontSize:11,color:C.textS,...mono,minWidth:40}}>:{s.line}</span>
+                    <span style={{fontSize:13,color:C.text}}>{s.message}</span>
+                  </div>
+                ))}
+                {result.codeSmells.length>12&&<p style={{color:C.textM,fontSize:12,textAlign:"center",margin:"6px 0 0"}}>...ve {result.codeSmells.length-12} sorun daha</p>}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [results,setResults]=useState([]);
+  const [sel,setSel]=useState(null);
+  const [tab,setTab]=useState("overview");
+  const [custom,setCustom]=useState({});
+  const [uName,setUName]=useState("");
+  const [uCode,setUCode]=useState("");
+  const [busy,setBusy]=useState(false);
+  const all=useMemo(()=>({...SAMPLE_FILES,...custom}),[custom]);
+
+  const analyze=useCallback(()=>{
+    setBusy(true);
+    setTimeout(()=>{
+      const r=Object.entries(all).map(([n,c])=>analyzeFile(n,c));
+      r.sort((a,b)=>a.score-b.score);
+      setResults(r);setBusy(false);setTab("overview");
+    },500);
+  },[all]);
+
+  useEffect(()=>{analyze();},[]);
+
+  const total=results.length>0?Math.round(results.reduce((s,r)=>s+r.score,0)/results.length):0;
+  const tGrade=total>=90?"A":total>=80?"B":total>=70?"C":total>=60?"D":"F";
+  const tSmells=results.reduce((s,r)=>s+r.codeSmells.length,0);
+  const tFns=results.reduce((s,r)=>s+r.functions.total,0);
+  const tLines=results.reduce((s,r)=>s+r.lines.code,0);
+  const avgDup=results.length>0?results.reduce((s,r)=>s+r.duplication.percentage,0)/results.length:0;
+  const grDist={A:0,B:0,C:0,D:0,F:0};
+  results.forEach(r=>{grDist[r.grade]++;});
+
+  const addFile=()=>{
+    if(uName&&uCode){setCustom(p=>({...p,[uName]:uCode}));setUName("");setUCode("");}
+  };
+  const removeFile=n=>setCustom(p=>{const x={...p};delete x[n];return x;});
+
+  const tabs=[{id:"overview",label:"Genel Bakis"},{id:"files",label:"Dosyalar"},{id:"upload",label:"Kod Yukle"}];
+
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,color:C.text}}>
+      {/* Header */}
+      <div style={{background:"linear-gradient(135deg,"+C.bgCard+" 0%,#0f1629 100%)",borderBottom:"1px solid "+C.border,padding:"18px 28px"}}>
+        <div style={{maxWidth:1200,margin:"0 auto",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <div style={{width:34,height:34,borderRadius:8,background:"linear-gradient(135deg,"+C.primary+","+C.info+")",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:13,color:"#fff"}}>TQ</div>
+            <div>
+              <h1 style={{margin:0,fontSize:17,fontWeight:700,letterSpacing:"-.02em"}}>TEDERGA Code Quality</h1>
+              <p style={{margin:0,fontSize:11,color:C.textM}}>Kod Kalitesi Analiz ve Raporlama Sistemi</p>
+            </div>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:12,color:C.textM}}>{results.length} dosya</span>
+            <button onClick={analyze} disabled={busy}
+              style={{padding:"7px 18px",borderRadius:8,border:"none",background:busy?C.border:"linear-gradient(135deg,"+C.primary+","+C.info+")",color:"#fff",fontSize:13,fontWeight:600,cursor:busy?"default":"pointer",opacity:busy?.6:1}}>
+              {busy?"Analiz ediliyor...":"▶ Analiz Et"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{maxWidth:1200,margin:"0 auto",padding:"0 28px"}}>
+        <div style={{display:"flex",borderBottom:"1px solid "+C.border,marginBottom:22}}>
+          {tabs.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)}
+              style={{padding:"13px 22px",background:"none",border:"none",borderBottom:"2px solid "+(tab===t.id?C.primary:"transparent"),color:tab===t.id?C.text:C.textM,fontSize:13,fontWeight:600,cursor:"pointer"}}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* OVERVIEW */}
+        {tab==="overview"&&results.length>0&&(
+          <div>
+            <div style={{display:"grid",gridTemplateColumns:"260px 1fr",gap:20,marginBottom:20}}>
+              <div style={{background:C.bgCard,borderRadius:14,border:"1px solid "+C.border,padding:24,display:"flex",flexDirection:"column",alignItems:"center",gap:14}}>
+                <Gauge score={total} grade={tGrade} size={150}/>
+                <div style={{textAlign:"center"}}>
+                  <p style={{color:C.textS,fontSize:12,margin:"0 0 4px"}}>Proje Genel Skoru</p>
+                  <p style={{color:gc(tGrade),fontSize:12,fontWeight:600,margin:0}}>{total>=80?"Iyi durumda":total>=60?"Iyilestirme gerekli":"Acil mudahale!"}</p>
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gridTemplateRows:"1fr 1fr",gap:14}}>
+                {[
+                  {l:"Toplam Dosya",v:results.length,c:C.primary},
+                  {l:"Toplam Satir",v:tLines.toLocaleString("tr-TR"),c:C.info},
+                  {l:"Fonksiyon",v:tFns,c:C.primaryL},
+                  {l:"Kod Sorunu",v:tSmells,c:tSmells>20?C.danger:C.warning},
+                  {l:"Ort. Tekrar",v:"%"+avgDup.toFixed(1),c:avgDup>10?C.danger:C.success},
+                  {l:"F Notu",v:grDist.F,c:grDist.F>0?C.danger:C.success},
+                ].map((s,i)=>(
+                  <div key={i} style={{background:C.bgCard,borderRadius:10,border:"1px solid "+C.border,padding:"14px 18px"}}>
+                    <p style={{margin:"0 0 6px",fontSize:10,color:C.textM,textTransform:"uppercase",letterSpacing:".06em"}}>{s.l}</p>
+                    <p style={{margin:0,fontSize:22,fontWeight:800,color:s.c,...mono}}>{s.v}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{background:C.bgCard,borderRadius:14,border:"1px solid "+C.border,padding:20,marginBottom:20}}>
+              <h3 style={{margin:"0 0 14px",fontSize:13,fontWeight:600,color:C.text,textTransform:"uppercase",letterSpacing:".05em"}}>Not Dagilimi</h3>
+              <div style={{display:"flex",gap:10,alignItems:"flex-end",height:110}}>
+                {Object.entries(grDist).map(([g,cnt])=>{
+                  const mx=Math.max(...Object.values(grDist),1);
+                  return (
+                    <div key={g} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:5}}>
+                      <span style={{fontSize:11,color:C.textS,...mono,fontWeight:600}}>{cnt}</span>
+                      <div style={{width:"100%",maxWidth:56,height:Math.max((cnt/mx)*100,3)+"%",background:gc(g),borderRadius:"5px 5px 0 0",opacity:cnt===0?.2:1}}/>
+                      <span style={{fontSize:13,fontWeight:800,color:gc(g),...mono}}>{g}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={{background:C.bgCard,borderRadius:14,border:"1px solid "+C.border,padding:20}}>
+              <h3 style={{margin:"0 0 14px",fontSize:13,fontWeight:600,color:C.text,textTransform:"uppercase",letterSpacing:".05em"}}>Dosya Siralamasi</h3>
+              {results.map((r,i)=>(
+                <div key={r.filename} onClick={()=>setSel(r)}
+                  style={{display:"flex",alignItems:"center",gap:14,padding:"11px 14px",background:C.bg,borderRadius:8,cursor:"pointer",border:"1px solid transparent",marginBottom:7,transition:"all .15s"}}
+                  onMouseEnter={e=>{e.currentTarget.style.background=C.bgHover;e.currentTarget.style.borderColor=C.borderL;}}
+                  onMouseLeave={e=>{e.currentTarget.style.background=C.bg;e.currentTarget.style.borderColor="transparent";}}>
+                  <span style={{width:22,textAlign:"center",fontSize:11,color:C.textM,...mono}}>#{i+1}</span>
+                  <div style={{width:38,height:38,borderRadius:7,background:gc(r.grade)+"18",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                    <span style={{fontWeight:800,fontSize:15,color:gc(r.grade),...mono}}>{r.grade}</span>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
+                      <span style={{fontSize:13,fontWeight:600,color:C.text}}>{r.filename}</span>
+                      <LangTag lang={r.language}/>
+                    </div>
+                    <span style={{fontSize:11,color:C.textM}}>{r.lines.code} satir · {r.functions.total} fn · {r.codeSmells.length} sorun</span>
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{width:110,height:5,background:C.border,borderRadius:3,overflow:"hidden",marginBottom:3}}>
+                      <div style={{height:"100%",width:r.score+"%",background:sc(r.score),borderRadius:3}}/>
+                    </div>
+                    <span style={{fontSize:12,fontWeight:700,color:sc(r.score),...mono}}>{r.score}/100</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* FILES */}
+        {tab==="files"&&(
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(300px,1fr))",gap:14}}>
+            {results.map(r=>(
+              <div key={r.filename} onClick={()=>setSel(r)}
+                style={{background:C.bgCard,borderRadius:12,border:"1px solid "+C.border,padding:20,cursor:"pointer",transition:"all .2s"}}
+                onMouseEnter={e=>{e.currentTarget.style.borderColor=C.borderL;e.currentTarget.style.transform="translateY(-2px)";}}
+                onMouseLeave={e=>{e.currentTarget.style.borderColor=C.border;e.currentTarget.style.transform="translateY(0)";}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+                  <div><h3 style={{margin:"0 0 5px",fontSize:14,fontWeight:700,color:C.text}}>{r.filename}</h3><LangTag lang={r.language}/></div>
+                  <Gauge score={r.score} grade={r.grade} size={60}/>
+                </div>
+                <Bar label="Karmasiklik" value={parseFloat(r.functions.avgComplexity)} max={20} color={parseFloat(r.functions.avgComplexity)<=7?C.success:C.warning}/>
+                <Bar label="Kod Tekrari" value={r.duplication.percentage} max={25} color={r.duplication.percentage<=5?C.success:C.warning} suffix="%"/>
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:10,fontSize:11,color:C.textM}}>
+                  <span>{r.lines.code} satir</span><span>{r.functions.total} fn</span><span>{r.codeSmells.length} sorun</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* UPLOAD */}
+        {tab==="upload"&&(
+          <div style={{maxWidth:760}}>
+            <div style={{background:C.bgCard,borderRadius:14,border:"1px solid "+C.border,padding:24}}>
+              <h3 style={{margin:"0 0 6px",fontSize:15,fontWeight:700,color:C.text}}>Kod Dosyasi Ekle</h3>
+              <p style={{margin:"0 0 18px",fontSize:12,color:C.textM}}>Analiz etmek istedigin kodu yapistir. Dosya uzantisina gore dil otomatik algilanir.</p>
+              <div style={{marginBottom:14}}>
+                <label style={{display:"block",fontSize:11,color:C.textS,marginBottom:5,fontWeight:600}}>Dosya Adi</label>
+                <input value={uName} onChange={e=>setUName(e.target.value)} placeholder="ornek: OrderService.cs, utils.ts, main.go"
+                  style={{width:"100%",padding:"9px 12px",borderRadius:7,border:"1px solid "+C.border,background:C.bg,color:C.text,fontSize:13,...mono,outline:"none",boxSizing:"border-box"}}/>
+              </div>
+              <div style={{marginBottom:18}}>
+                <label style={{display:"block",fontSize:11,color:C.textS,marginBottom:5,fontWeight:600}}>Kod Icerigi</label>
+                <textarea value={uCode} onChange={e=>setUCode(e.target.value)} placeholder="Kodu buraya yapistir..." rows={14}
+                  style={{width:"100%",padding:"12px",borderRadius:7,border:"1px solid "+C.border,background:C.bg,color:C.text,fontSize:12,...mono,outline:"none",resize:"vertical",lineHeight:1.6,boxSizing:"border-box"}}/>
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                <button onClick={addFile} disabled={!uName||!uCode}
+                  style={{padding:"9px 22px",borderRadius:7,border:"none",background:uName&&uCode?C.primary:C.border,color:"#fff",fontSize:13,fontWeight:600,cursor:uName&&uCode?"pointer":"default"}}>
+                  + Dosya Ekle
+                </button>
+                <button onClick={analyze}
+                  style={{padding:"9px 22px",borderRadius:7,border:"1px solid "+C.primary,background:"transparent",color:C.primary,fontSize:13,fontWeight:600,cursor:"pointer"}}>
+                  Tumunu Analiz Et
+                </button>
+              </div>
+            </div>
+            {Object.keys(custom).length>0&&(
+              <div style={{marginTop:16,background:C.bgCard,borderRadius:14,border:"1px solid "+C.border,padding:20}}>
+                <h4 style={{margin:"0 0 10px",fontSize:12,color:C.textM,textTransform:"uppercase"}}>Eklenen Dosyalar</h4>
+                {Object.keys(custom).map(n=>(
+                  <div key={n} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 12px",background:C.bg,borderRadius:7,marginBottom:7}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <LangTag lang={detectLanguage(n)}/>
+                      <span style={{fontSize:13,color:C.text}}>{n}</span>
+                      <span style={{fontSize:11,color:C.textM}}>({custom[n].split("\n").length} satir)</span>
+                    </div>
+                    <button onClick={()=>removeFile(n)} style={{background:"none",border:"none",color:C.danger,cursor:"pointer",fontSize:16,lineHeight:1}}>&#x2715;</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{height:36}}/>
+      </div>
+      <Detail result={sel} onClose={()=>setSel(null)}/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
